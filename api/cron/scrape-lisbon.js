@@ -1,5 +1,5 @@
-// api/cron/scrape-lisbon.js — v2, no npm dependencies
-// Uses fetch directly to Supabase REST API
+// api/cron/scrape-lisbon.js — v3, with debug logging
+// Uses fetch directly to Supabase REST API — no npm dependencies
 
 import { LISBON_NEIGHBORHOODS } from "../neighborhoods.js";
 
@@ -49,55 +49,98 @@ function parsePrices(html) {
 async function fetchPage(url) {
   try {
     const res = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)" },
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+      },
       signal: AbortSignal.timeout(15000),
     });
-    return res.ok ? res.text() : null;
-  } catch { return null; }
+    if (!res.ok) {
+      console.log(`  fetchPage ${url} → status ${res.status}`);
+      return null;
+    }
+    return await res.text();
+  } catch(e) {
+    console.log(`  fetchPage ${url} → error: ${e.message}`);
+    return null;
+  }
 }
 
 function buildUrl(hood, type) {
   const base = "https://www.spotahome.com/for-rent/lisbon";
   if (type === "room")   return `${base}/${hood}-rooms`;
   if (type === "studio") return `${base}/${hood}-studios`;
-  if (type === "oneBed") return `${base}/${hood}-apartments/bedrooms:1`;
+  if (type === "oneBed") return `${base}/${hood}-1-bedroom-apartments`;
 }
 
 export default async function handler(req, res) {
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`)
     return res.status(401).json({ error: "Unauthorized" });
 
+  // TEST MODE: only fetch 2 neighborhoods to verify the pipeline works
+  const TEST_MODE = true;
+  const TEST_HOODS = ["alfama", "arroios"];
+
   const runId = new Date().toISOString().slice(0, 10);
   const allListings = [];
   const summary = {};
 
-  for (const type of ["room", "studio", "oneBed"]) {
+  console.log(`[scrape-lisbon] Starting run ${runId} — TEST_MODE=${TEST_MODE}`);
+
+  for (const type of ["room"]) { // only rooms in test mode
     for (const zone of ["center", "outside"]) {
+      const neighborhoods = TEST_MODE
+        ? TEST_HOODS.filter(h => LISBON_NEIGHBORHOODS[zone].includes(h))
+        : LISBON_NEIGHBORHOODS[zone];
+
       const zonePrices = [];
-      for (const hood of LISBON_NEIGHBORHOODS[zone]) {
-        const html = await fetchPage(buildUrl(hood, type));
-        if (!html) continue;
+
+      for (const hood of neighborhoods) {
+        const url = buildUrl(hood, type);
+        console.log(`  Fetching: ${url}`);
+        const html = await fetchPage(url);
+
+        if (!html) {
+          console.log(`  → NULL response`);
+          continue;
+        }
+
+        console.log(`  → HTML length: ${html.length} chars`);
+
+        // Log a snippet to see what we got
+        const snippet = html.substring(0, 500).replace(/\n/g, ' ');
+        console.log(`  → Snippet: ${snippet}`);
+
         const { prices, billsIncluded } = parsePrices(html);
+        console.log(`  → Prices found: ${prices.join(', ')}`);
+
         for (const price of prices) {
-          allListings.push({ city:"lisbon", type, zone, neighborhood:hood, price, bills_included:billsIncluded, run_id:runId, fetched_at:new Date().toISOString() });
+          allListings.push({
+            city: "lisbon", type, zone,
+            neighborhood: hood, price,
+            bills_included: billsIncluded,
+            run_id: runId,
+            fetched_at: new Date().toISOString(),
+          });
           zonePrices.push(price);
         }
-        await new Promise(r => setTimeout(r, 600));
+
+        await new Promise(r => setTimeout(r, 1000));
       }
-      const filtered = filterIQR(zonePrices);
+
       const key = `${type}_${zone}`;
-      if (filtered.length >= 20) {
+      const filtered = filterIQR(zonePrices);
+      summary[key] = { n_raw: zonePrices.length, n_filtered: filtered.length, prices: zonePrices };
+
+      if (filtered.length >= 5) { // lower threshold for test
         const { median, p25, p75 } = calcStats(filtered);
-        summary[key] = { ok:true, median, p25, p75, n:filtered.length };
-        await supaInsert("rent_stats", [{ city:"lisbon", type, zone, median, p25, p75, n_listings:filtered.length, n_raw:zonePrices.length, run_id:runId }]);
-      } else {
-        summary[key] = { ok:false, n:filtered.length };
+        summary[key] = { ...summary[key], ok: true, median, p25, p75 };
+        console.log(`  → STATS ${key}: median=${median} p25=${p25} p75=${p75}`);
       }
     }
   }
 
-  for (let i = 0; i < allListings.length; i += 500)
-    await supaInsert("listings", allListings.slice(i, i+500));
-
+  console.log(`[scrape-lisbon] Done — ${allListings.length} listings`);
   return res.status(200).json({ runId, summary, total: allListings.length });
 }

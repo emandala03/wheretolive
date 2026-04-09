@@ -1,5 +1,5 @@
-// api/cron/scrape-lisbon.js — v3, with debug logging
-// Uses fetch directly to Supabase REST API — no npm dependencies
+// api/cron/scrape-lisbon.js — v4
+// Uses /s/lisbon/for-rent:rooms URL format which is SSR and returns prices in HTML
 
 import { LISBON_NEIGHBORHOODS } from "../neighborhoods.js";
 
@@ -40,10 +40,27 @@ function calcStats(prices) {
 function parsePrices(html) {
   const prices = [];
   let m;
-  const re = /(\d{3,4})\s*€\/month/g;
-  while ((m = re.exec(html)) !== null) prices.push(parseInt(m[1], 10));
+  // Try multiple price patterns
+  const patterns = [
+    /(\d{3,4})\s*€\/month/g,           // "500 €/month"
+    /\"price\":\s*(\d{3,4})/g,          // JSON: "price": 500
+    /data-price=\"(\d{3,4})\"/g,        // data-price="500"
+    /(\d{3,4})\s*€\s*\/\s*month/g,     // "500 € / month"
+    /price[^>]*>\s*(\d{3,4})/g,        // price>500
+  ];
+  
+  for (const re of patterns) {
+    re.lastIndex = 0;
+    while ((m = re.exec(html)) !== null) {
+      const p = parseInt(m[1], 10);
+      if (p >= 200 && p <= 3000) prices.push(p); // sanity range
+    }
+  }
+  
+  // Deduplicate
+  const unique = [...new Set(prices)];
   const billsCount = (html.match(/BILLS INCLUDED/gi) || []).length;
-  return { prices, billsIncluded: billsCount > prices.length * 0.5 };
+  return { prices: unique, billsIncluded: billsCount > unique.length * 0.5 };
 }
 
 async function fetchPage(url) {
@@ -53,6 +70,8 @@ async function fetchPage(url) {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
       },
       signal: AbortSignal.timeout(15000),
     });
@@ -62,23 +81,24 @@ async function fetchPage(url) {
     }
     return await res.text();
   } catch(e) {
-    console.log(`  fetchPage ${url} → error: ${e.message}`);
+    console.log(`  fetchPage error: ${e.message}`);
     return null;
   }
 }
 
+// Build URLs using the SSR format that worked in our manual test
 function buildUrl(hood, type) {
-  const base = "https://www.spotahome.com/for-rent/lisbon";
-  if (type === "room")   return `${base}/${hood}-rooms`;
-  if (type === "studio") return `${base}/${hood}-studios`;
-  if (type === "oneBed") return `${base}/${hood}-1-bedroom-apartments`;
+  const base = "https://www.spotahome.com/s/lisbon";
+  if (type === "room")   return `${base}/for-rent:rooms?neighborhood=${hood}`;
+  if (type === "studio") return `${base}/for-rent:studios?neighborhood=${hood}`;
+  if (type === "oneBed") return `${base}/for-rent:apartments?neighborhood=${hood}&bedrooms=1`;
 }
 
 export default async function handler(req, res) {
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`)
     return res.status(401).json({ error: "Unauthorized" });
 
-  // TEST MODE: only fetch 2 neighborhoods to verify the pipeline works
+  // TEST MODE: only 2 neighborhoods, only rooms
   const TEST_MODE = true;
   const TEST_HOODS = ["alfama", "arroios"];
 
@@ -86,9 +106,9 @@ export default async function handler(req, res) {
   const allListings = [];
   const summary = {};
 
-  console.log(`[scrape-lisbon] Starting run ${runId} — TEST_MODE=${TEST_MODE}`);
+  console.log(`[scrape-lisbon] v4 — run ${runId}`);
 
-  for (const type of ["room"]) { // only rooms in test mode
+  for (const type of ["room"]) {
     for (const zone of ["center", "outside"]) {
       const neighborhoods = TEST_MODE
         ? TEST_HOODS.filter(h => LISBON_NEIGHBORHOODS[zone].includes(h))
@@ -101,19 +121,22 @@ export default async function handler(req, res) {
         console.log(`  Fetching: ${url}`);
         const html = await fetchPage(url);
 
-        if (!html) {
-          console.log(`  → NULL response`);
-          continue;
+        if (!html) { console.log(`  → NULL`); continue; }
+
+        console.log(`  → HTML: ${html.length} chars`);
+
+        // Log snippet around price patterns to debug
+        const priceIdx = html.indexOf("€");
+        if (priceIdx > 0) {
+          console.log(`  → Near first €: ${html.substring(priceIdx-50, priceIdx+50).replace(/\n/g,' ')}`);
+        } else {
+          console.log(`  → No € found in HTML`);
+          // Log first 300 chars to see what we got
+          console.log(`  → Start: ${html.substring(0,300).replace(/\n/g,' ')}`);
         }
 
-        console.log(`  → HTML length: ${html.length} chars`);
-
-        // Log a snippet to see what we got
-        const snippet = html.substring(0, 500).replace(/\n/g, ' ');
-        console.log(`  → Snippet: ${snippet}`);
-
         const { prices, billsIncluded } = parsePrices(html);
-        console.log(`  → Prices found: ${prices.join(', ')}`);
+        console.log(`  → Prices: [${prices.join(', ')}]`);
 
         for (const price of prices) {
           allListings.push({
@@ -133,10 +156,10 @@ export default async function handler(req, res) {
       const filtered = filterIQR(zonePrices);
       summary[key] = { n_raw: zonePrices.length, n_filtered: filtered.length, prices: zonePrices };
 
-      if (filtered.length >= 5) { // lower threshold for test
+      if (filtered.length >= 3) {
         const { median, p25, p75 } = calcStats(filtered);
         summary[key] = { ...summary[key], ok: true, median, p25, p75 };
-        console.log(`  → STATS ${key}: median=${median} p25=${p25} p75=${p75}`);
+        console.log(`  → STATS ${key}: median=${median} range=${p25}–${p75}`);
       }
     }
   }
